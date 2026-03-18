@@ -1,0 +1,23 @@
+{
+  "name": "mp-tools",
+  "description": "Claude Code plugin for Mountain Project / onX Adventure development",
+  "version": "1.1.0",
+  "metadata": {
+    "description": "Claude Code plugin for Mountain Project / onX Adventure development"
+  },
+  "owner": {
+    "name": "onXmaps",
+    "url": "https://github.com/onXmaps"
+  },
+  "plugins": [
+    {
+      "name": "mp-tools",
+      "description": "Mountain Project development tools: API client, data pack audit, release branch management",
+      "version": "1.1.0",
+      "author": {
+        "name": "eric.internicola"
+      },
+      "source": "."
+    }
+  ]
+}
