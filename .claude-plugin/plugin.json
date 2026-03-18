@@ -1,0 +1,5 @@
+{
+  "name": "mp-tools",
+  "version": "1.0.0",
+  "description": "Mountain Project development tools including API client for testing endpoints, debugging topos, and exploring API behavior"
+}
