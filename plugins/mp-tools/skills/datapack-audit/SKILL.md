@@ -1,62 +1,68 @@
 ---
 name: datapack-audit
-description: This skill should be used when auditing mobile data packs in the adventure-project repo to find missing, failed, corrupt, or stale packs. Use when the user says "audit data packs", "check if packs failed", "find missing data packs", "which data packs failed to generate", or "validate mobile packages". Covers all project types (climb, hike, mtb, ski, trailrun).
+description: This skill should be used when auditing mobile data packs in the adventure-project to find missing, failed, corrupt, or stale packs in production. Use when the user says "audit data packs", "check if packs failed", "find missing data packs", "which data packs failed to generate", or "validate mobile packages". Covers all project types (climb, hike, mtb, ski, trailrun).
 ---
 
 # Data Pack Audit
 
-Audit mobile data packs in the adventure-project repo to identify packs that failed to generate, are missing, corrupt, stale, or (for Climb) missing topo content.
+Audit production mobile data packs to identify packs that failed to generate, are suspiciously small, or are stale. Works against live production APIs — no local server or Docker required.
 
-## Purpose
-
-Data packs are weekly-generated gzip files served to mobile apps for offline use. Generation failures result in missing or malformed files. This skill provides a workflow to detect failures across all project types and report actionable findings.
-
-For full architecture details, record types, artisan commands, and failure modes, read the reference file:
+For full architecture details, record types, artisan commands, and failure modes, read:
 `references/datapack-architecture.md` (in this skill's directory)
 
 ## Audit Workflow
 
-### Step 1: Quick Filesystem Audit
+### Step 1: Run the Production Audit Script
 
-Run the bundled script from the adventure-project repo root to scan all pack files on disk:
+Run the bundled Python script from anywhere (no repo context needed):
 
 ```bash
-# All projects
-bash <skill-dir>/scripts/audit-datapack-files.sh
+# Audit all project types against production
+python3 <skill-dir>/scripts/audit-production.py
 
-# Single project
-bash <skill-dir>/scripts/audit-datapack-files.sh climb
+# Audit a single project
+python3 <skill-dir>/scripts/audit-production.py --project climb
+python3 <skill-dir>/scripts/audit-production.py --project hike
 ```
 
-The script reports each pack's status:
-- **OK** — file exists, size looks reasonable, not stale
-- **FAIL** — file missing or suspiciously small (<1KB)
-- **STALE** — file is older than 14 days (generation runs weekly; >14 days indicates a missed run)
-- **WARN** — minor issue (e.g., missing `.txt` companion file)
+The script:
+1. Calls `getPackageList` on each project's production API to enumerate existing packs
+2. **Climb**: checks the `size` field returned per-pack, checks `lastBuild` staleness
+3. **AP projects** (hike/mtb/ski/trailrun): HEADs each CDN URL to get file size, checks `buildDate` per-pack
 
-The script exits non-zero if any FAILures are found.
+Each pack is reported as:
+- **OK** — exists, size looks reasonable
+- **FAIL** — zero size, too small (<50 KB), or CDN unreachable
+- **STALE** — pack exists and passes size check but is older than 14 days
 
-### Step 2: Artisan Validation (optional, runs in Docker)
+Exits non-zero if any FAILures are found.
 
-To run the server-side validation logic (which also checks pack format and ID correctness):
+**Important:** Packs that failed to generate entirely will NOT appear in `getPackageList` at all — the API silently omits areas with no file. A pack that is truly missing shows up as absent from the list, not as a FAIL row. To detect truly missing packs, compare the count against the expected number of top-level areas (see Step 2).
+
+### Step 2: Interpret the Results
+
+**Pack count sanity check** — compare the number reported against known baselines:
+
+| Project | Expected packs (approx) |
+|---------|------------------------|
+| climb   | ~70–80 areas           |
+| hike    | ~50–60 areas           |
+| mtb     | ~40–50 areas           |
+| ski     | ~20–30 areas           |
+| trailrun| ~20–30 areas           |
+
+If the count is significantly lower than expected, packs are missing from the list entirely (generation failure — file was never written).
+
+**Climb `lastBuild`** — this is the most recent build time across ALL Climb packs. If it is >14 days old, the weekly generation job likely missed a run.
+
+### Step 3: Verify Climb Topo Content (Climb only, as needed)
+
+Standard size checks do not verify topo content. If Climb packs look structurally OK but topos are suspected missing:
 
 ```bash
-# Validate all areas for a project type
-npm run php:artisan -- ap:validateMobilePackagesV2 {projectType}
-
-# Validate a specific area
-npm run php:artisan -- ap:validateMobilePackagesV2 {projectType} {areaId}
-```
-
-**WARNING:** This command automatically triggers regeneration for any pack it finds invalid. Run it only when repair is acceptable. Output lines containing `===== [ERROR]` indicate failures.
-
-### Step 3: Climb Topo Verification (Climb only)
-
-For Climb packs, the above checks do not validate topo content. Use the Python verifier:
-
-```bash
+# Download and analyze a specific Climb pack for topo records
 python3 bin/verify_datapack.py \
-  --url "https://local.mountainproject.com/api?action=getPackageData&id={areaId}&apiVersion=2" \
+  --url "https://www.mountainproject.com/api?action=getPackageData&id={areaId}&apiVersion=2&os=iOS&osVersion=18.0&v=4.6.0&deviceId=00000000-0000-0000-0000-000000000000" \
   --out-prefix /tmp/V2-{areaId}
 ```
 
@@ -64,36 +70,33 @@ A pack **FAILS** topo verification if:
 - No TYPE=11 (TOPO) records are present, OR
 - No areas or routes contain `topoRelations`
 
-The script exits 0 on PASS, 1 on FAIL.
+Run from the adventure-project repo root. Exits 0 on PASS, 1 on FAIL.
 
-### Step 4: Report Findings
+### Step 4: Trigger Regeneration (requires Docker / adventure-project repo)
 
-After running the above steps, report:
-1. Which packs are missing (never generated or deleted)
-2. Which packs are malformed (wrong ID, wrong format)
-3. Which packs are stale (generation appears to have been skipped)
-4. For Climb: which packs are missing topo content
-
-Include area IDs and project types in the report so the user can target specific regeneration commands.
-
-## Regeneration Commands
-
-To regenerate a specific failing pack without triggering the full validation:
+To regenerate specific failing packs, run from the adventure-project repo root:
 
 ```bash
-# AP projects (hike, mtb, ski, trailrun)
+# AP projects (hike, mtb, ski, trailrun) — specific area
 npm run php:artisan -- ap:createMobilePackagesV2 {projectType} {areaId}
 
-# Climb
+# AP projects — all areas (long-running)
+npm run php:artisan -- ap:createMobilePackagesV2 {projectType}
+
+# Climb — specific area
 npm run php:artisan -- ap:createMobilePackagesMPV2 climb {areaId}
 
-# Regenerate ALL packs for a project (long-running)
-npm run php:artisan -- ap:createMobilePackagesV2 {projectType}
+# Climb — all areas (long-running)
 npm run php:artisan -- ap:createMobilePackagesMPV2 climb
+
+# Validate + auto-repair (runs regen for any missing/malformed pack)
+npm run php:artisan -- ap:validateMobilePackagesV2 {projectType}
 ```
 
-## Key Paths
+## Key Facts
 
-- Pack files: `site/public/assets/mobile/{projectType}/V2-{areaId}.txt.gz`
-- Artisan commands: run via `npm run php:artisan --` (executes inside Docker `jobs` container)
-- Python verifier: `bin/verify_datapack.py` (run directly on host, requires Python 3)
+- **CDN URL pattern**: `https://cdn2.apstatic.com/mobile/{projectType}/V2-{areaId}.txt.gz`
+- **getPackageList**: public endpoint, no auth required
+- **Climb response**: `{ packages: [{id, title, size, ...}], lastBuild }` — size is bytes per pack
+- **AP response**: `[{id, title, buildDate, ...}]` — NO size field; must HEAD CDN for size
+- **Generation schedule**: weekly, Saturdays 20:00 UTC
