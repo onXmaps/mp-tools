@@ -2,23 +2,33 @@
 """
 audit-production.py — Audit production data packs via the getPackageList API.
 
-For each project type, queries the production getPackageList endpoint and checks
-pack sizes and staleness. For AP projects (no size in response), also HEADs the
-CDN URL to get file size.
+Uses the embedded timestamp baked into each pack file as the authoritative build
+date (200-byte Range request on the uncompressed .txt file). Falls back to the
+CDN Last-Modified header (HEAD on .gz) for Climb, or the API buildDate field for
+AP projects, if the .txt Range request fails.
+
+Packs are judged against the most recent build date within their project:
+  CURRENT — within 3 days of the most recent pack
+  BEHIND  — 3–14 days behind (missed one weekly generation cycle)
+  STALE   — >14 days behind (missed multiple cycles)
 
 Usage:
     python3 audit-production.py
     python3 audit-production.py --project climb
     python3 audit-production.py --project hike
+    python3 audit-production.py --verbose
 """
 
 import argparse
 import json
 import ssl
+import struct
 import sys
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 # Production domains per project type
 PROJECTS = {
@@ -29,176 +39,286 @@ PROJECTS = {
     "trailrun": "www.trailrunproject.com",
 }
 
-CDN_BASE = "https://cdn2.apstatic.com"
+CDN_BASE      = "https://cdn2.apstatic.com"
+API_PARAMS    = "apiVersion=2&os=iOS&osVersion=18.0&v=4.6.0&deviceId=00000000-0000-0000-0000-000000000000"
+CURRENT_DAYS  = 3    # within this many days of latest → CURRENT
+BEHIND_DAYS   = 14   # beyond this → STALE (between CURRENT_DAYS and this → BEHIND)
+MAX_WORKERS   = 20
 
-# Thresholds
-STALE_DAYS = 14           # flag packs older than this
-MIN_SIZE_BYTES = 50_000   # 50 KB — anything smaller is suspicious
-
-# ANSI colors
 RED    = "\033[0;31m"
 YELLOW = "\033[1;33m"
 GREEN  = "\033[0;32m"
 BOLD   = "\033[1m"
+DIM    = "\033[2m"
 NC     = "\033[0m"
 
 def c(text, code):
     return f"{code}{text}{NC}"
 
-
-def make_ssl_ctx():
-    return ssl.create_default_context()
-
-
-def fetch_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "datapack-auditor/1.0"})
-    with urllib.request.urlopen(req, context=make_ssl_ctx(), timeout=30) as resp:
-        return json.loads(resp.read().decode("utf-8"))
-
-
-def head_size(url):
-    """Return Content-Length from a HEAD request, or None on failure."""
-    req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "datapack-auditor/1.0"})
-    try:
-        with urllib.request.urlopen(req, context=make_ssl_ctx(), timeout=15) as resp:
-            cl = resp.headers.get("Content-Length")
-            return int(cl) if cl else None
-    except Exception as e:
-        return None
-
-
-def fmt_size(bytes_):
-    if bytes_ is None:
-        return "??KB"
-    if bytes_ < 1024:
-        return f"{bytes_}B"
-    if bytes_ < 1024 * 1024:
-        return f"{bytes_ // 1024}KB"
-    return f"{bytes_ / (1024 * 1024):.1f}MB"
-
-
 def fmt_date(ts):
     if not ts:
-        return "unknown"
+        return "unknown   "
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
 
+def fmt_size(n):
+    if n is None: return "    ?"
+    if n < 1024:  return f"{n}B"
+    if n < 1024 ** 2: return f"{n // 1024}KB"
+    return f"{n / 1024 ** 2:.1f}MB"
 
-def age_days(ts):
-    if not ts:
+def age_days(ts, ref=None):
+    if not ts: return None
+    return ((ref or time.time()) - ts) / 86400
+
+
+# ── HTTP helpers ──────────────────────────────────────────────────────────────
+
+_ssl_ctx = ssl.create_default_context()
+
+def _req(url, method="GET", headers=None, rng=None):
+    h = {"User-Agent": "datapack-auditor/1.0"}
+    if headers: h.update(headers)
+    if rng is not None: h["Range"] = f"bytes=0-{rng}"
+    req = urllib.request.Request(url, method=method, headers=h)
+    try:
+        with urllib.request.urlopen(req, context=_ssl_ctx, timeout=15) as r:
+            return r.status, r.read(), r.headers
+    except urllib.error.HTTPError as e:
+        return e.code, b"", e.headers
+    except Exception:
+        return None, b"", {}
+
+def fetch_json(url):
+    _, body, _ = _req(url)
+    return json.loads(body.decode("utf-8"))
+
+
+# ── Timestamp extraction ──────────────────────────────────────────────────────
+
+def embedded_ts_climb(area_id):
+    """
+    Range-fetch the first 300 bytes of the uncompressed .txt pack.
+    Climb packs use a binary framed format:
+      [8B length LE][8B type LE][JSON payload]
+    The PACKAGE record (type=1) is always first and contains buildDate.
+    """
+    status, body, _ = _req(f"{CDN_BASE}/mobile/climb/V2-{area_id}.txt", rng=299)
+    if status not in (200, 206) or len(body) < 16:
         return None
-    return (time.time() - ts) / 86400
+    try:
+        length  = struct.unpack_from("<Q", body, 0)[0]
+        payload = body[16:16 + min(length, len(body) - 16)]
+        return json.loads(payload).get("buildDate")
+    except Exception:
+        return None
+
+def embedded_ts_ap(project, area_id):
+    """
+    Range-fetch the first 150 bytes of the uncompressed .txt pack.
+    AP packs use a plaintext format: Package_{id}_{timestamp}_{json}\\n
+    """
+    status, body, _ = _req(f"{CDN_BASE}/mobile/{project}/V2-{area_id}.txt", rng=149)
+    if status not in (200, 206) or not body:
+        return None
+    try:
+        line  = body.split(b"\n")[0].decode("utf-8", errors="replace")
+        parts = line.split("_", 3)
+        return int(parts[2]) if len(parts) >= 3 else None
+    except Exception:
+        return None
+
+def last_modified_ts(url_gz):
+    """HEAD the .gz and parse Last-Modified as a fallback."""
+    status, _, hdrs = _req(url_gz, method="HEAD")
+    if status not in (200, 206):
+        return None
+    lm = hdrs.get("Last-Modified")
+    try:
+        return int(parsedate_to_datetime(lm).timestamp()) if lm else None
+    except Exception:
+        return None
+
+def pack_date_climb(area_id):
+    """Embedded buildDate primary; Last-Modified on .gz as fallback."""
+    ts = embedded_ts_climb(area_id)
+    if ts is None:
+        ts = last_modified_ts(f"{CDN_BASE}/mobile/climb/V2-{area_id}.txt.gz")
+    return ts
+
+def pack_date_ap(project, area_id, api_build_date=None):
+    """Embedded timestamp primary; API buildDate as fallback."""
+    ts = embedded_ts_ap(project, area_id)
+    if ts is None and api_build_date:
+        ts = api_build_date
+    return ts
 
 
-def audit_climb():
-    """
-    Climb getPackageList returns:
-      { "packages": [{ "id", "title", "size" (bytes), "x", "y", "intl", "numRoutes" }],
-        "lastBuild": <epoch> }
-    Size is included per-pack. No per-pack buildDate — only top-level lastBuild.
-    """
-    domain = PROJECTS["climb"]
-    url = (f"https://{domain}/api?action=getPackageList&apiVersion=2"
-           f"&os=iOS&osVersion=18.0&v=4.6.0&deviceId=00000000-0000-0000-0000-000000000000")
-    print(f"\n{c('=== climb ===', BOLD)}")
+# ── Audit functions ───────────────────────────────────────────────────────────
+
+def audit_climb(verbose):
+    url = f"https://{PROJECTS['climb']}/api?action=getPackageList&{API_PARAMS}"
+    print(f"\n{c('=== climb ===', BOLD)}", flush=True)
 
     try:
-        data = fetch_json(url)
+        data     = fetch_json(url)
+        packages = data.get("packages", [])
     except Exception as e:
         print(c(f"  [ERROR] getPackageList failed: {e}", RED))
-        return 0, 1, 0
+        return 0, 0, 1
 
-    packages  = data.get("packages", [])
-    last_build = data.get("lastBuild", 0)
-    lb_age    = age_days(last_build)
+    print(f"  {len(packages)} packs — fetching embedded timestamps in parallel...", flush=True)
 
-    if lb_age is not None:
-        lb_color = YELLOW if lb_age > STALE_DAYS else GREEN
-        print(f"  lastBuild: {c(f'{lb_age:.1f}d ago', lb_color)} ({fmt_date(last_build)})")
-    print(f"  {len(packages)} pack(s) in list")
+    # Fetch all dates in parallel
+    rows = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futs = {ex.submit(pack_date_climb, p["id"]): p for p in packages}
+        for fut in as_completed(futs):
+            p  = futs[fut]
+            ts = fut.result()
+            rows[p["id"]] = {**p, "_ts": ts}
 
-    passes = fails = stale = 0
-    for pkg in packages:
-        pid   = pkg.get("id", "?")
-        title = pkg.get("title", "?")[:45]
-        size  = pkg.get("size", 0)
-        notes = [fmt_size(size)]
+    # Determine most recent date among all packs
+    valid_ts = [r["_ts"] for r in rows.values() if r["_ts"]]
+    if not valid_ts:
+        print(c("  [ERROR] No timestamps retrieved", RED))
+        return 0, 0, 1
+    latest_ts = max(valid_ts)
+    latest_dt = fmt_date(latest_ts)
+    now       = time.time()
 
-        if size == 0 or size < MIN_SIZE_BYTES:
-            status, sc = "FAIL", RED
-            fails += 1
-            if size == 0:
-                notes.append("ZERO SIZE")
-            else:
-                notes.append("TOO SMALL")
-        else:
-            status, sc = "OK", GREEN
-            passes += 1
+    current_packs = [r for r in rows.values() if r["_ts"] and age_days(r["_ts"], latest_ts) <= CURRENT_DAYS]
+    behind_packs  = [r for r in rows.values() if r["_ts"] and CURRENT_DAYS < age_days(r["_ts"], latest_ts) <= BEHIND_DAYS]
+    stale_packs   = [r for r in rows.values() if r["_ts"] and age_days(r["_ts"], latest_ts) > BEHIND_DAYS]
+    nodate_packs  = [r for r in rows.values() if not r["_ts"]]
 
-        print(f"  {c(f'[{status}]', sc)} id={pid:<12} {title:<45}  {' '.join(notes)}")
+    print(f"  Most recent pack: {latest_dt} ({age_days(latest_ts, now):.1f}d ago)")
+    print(f"  {c(f'CURRENT: {len(current_packs)}', GREEN)}  "
+          f"{c(f'BEHIND: {len(behind_packs)}', YELLOW)}  "
+          f"{c(f'STALE: {len(stale_packs)}', RED)}  "
+          f"NO_DATE: {len(nodate_packs)}")
 
-    return passes, fails, stale
+    def print_pack(r, status_color, lag_str):
+        pid   = r["id"]
+        title = r["title"][:40]
+        size  = fmt_size(r["size"])
+        dt    = fmt_date(r["_ts"])
+        routes = r.get("numRoutes", 0)
+        print(f"    {dt}  {lag_str:>14}  routes={routes:>5}  {size:>8}  {title}")
+
+    if behind_packs:
+        behind_packs.sort(key=lambda r: r["_ts"])
+        print(f"\n  {c(f'BEHIND ({len(behind_packs)} packs — missed last run):', YELLOW)}")
+        for r in behind_packs:
+            lag = age_days(r["_ts"], latest_ts)
+            print_pack(r, YELLOW, f"+{lag:.0f}d behind")
+
+    if stale_packs:
+        stale_packs.sort(key=lambda r: r["_ts"])
+        print(f"\n  {c(f'STALE ({len(stale_packs)} packs):', RED)}")
+        for r in stale_packs:
+            lag = age_days(r["_ts"], latest_ts)
+            print_pack(r, RED, f"+{lag:.0f}d behind")
+
+    if verbose and current_packs:
+        current_packs.sort(key=lambda r: r["title"])
+        print(f"\n  {c(f'CURRENT ({len(current_packs)} packs):', GREEN)}")
+        for r in current_packs:
+            print_pack(r, GREEN, "current")
+
+    if nodate_packs:
+        print(f"\n  {c(f'NO DATE ({len(nodate_packs)} packs):', DIM)}")
+        for r in nodate_packs:
+            print(f"    {r['title']}")
+
+    n_fail = len(stale_packs)
+    n_warn = len(behind_packs)
+    n_ok   = len(current_packs)
+    return n_ok, n_warn, n_fail
 
 
-def audit_ap(project):
-    """
-    AP getPackageList returns an array:
-      [{ "id", "title", "photoUrl", "buildDate" (epoch), "intl", "x", "y",
-         "searchRadius", "l", "t", "r", "b", "polygon", "numTrails", "lengthOfAllTrails" }]
-    No size in response — must HEAD the CDN URL to get file size.
-    """
-    domain = PROJECTS[project]
-    url = (f"https://{domain}/api?action=getPackageList&apiVersion=2"
-           f"&os=iOS&osVersion=18.0&v=4.6.0&deviceId=00000000-0000-0000-0000-000000000000")
-    print(f"\n{c(f'=== {project} ===', BOLD)}")
+def audit_ap(project, verbose):
+    url = f"https://{PROJECTS[project]}/api?action=getPackageList&{API_PARAMS}"
+    print(f"\n{c(f'=== {project} ===', BOLD)}", flush=True)
 
     try:
         packages = fetch_json(url)
+        if not isinstance(packages, list):
+            raise ValueError(f"Unexpected response type: {type(packages)}")
     except Exception as e:
         print(c(f"  [ERROR] getPackageList failed: {e}", RED))
-        return 0, 1, 0
+        return 0, 0, 1
 
-    if not isinstance(packages, list):
-        print(c(f"  [ERROR] Unexpected response format: {type(packages)}", RED))
-        return 0, 1, 0
+    print(f"  {len(packages)} packs — fetching embedded timestamps in parallel...", flush=True)
 
-    print(f"  {len(packages)} pack(s) in list")
+    rows = {}
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futs = {
+            ex.submit(pack_date_ap, project, p["id"], p.get("buildDate")): p
+            for p in packages
+        }
+        for fut in as_completed(futs):
+            p  = futs[fut]
+            ts = fut.result()
+            rows[p["id"]] = {**p, "_ts": ts}
 
-    passes = fails = stale = 0
-    for pkg in packages:
-        pid        = pkg.get("id", "?")
-        title      = pkg.get("title", "?")[:45]
-        build_date = pkg.get("buildDate", 0)
-        cdn_url    = f"{CDN_BASE}/mobile/{project}/V2-{pid}.txt.gz"
+    valid_ts = [r["_ts"] for r in rows.values() if r["_ts"]]
+    if not valid_ts:
+        print(c("  [ERROR] No timestamps retrieved", RED))
+        return 0, 0, 1
+    latest_ts = max(valid_ts)
+    now       = time.time()
 
-        size  = head_size(cdn_url)
-        notes = [fmt_size(size)]
-        ba    = age_days(build_date)
-        if ba is not None:
-            notes.append(f"age={ba:.0f}d")
+    current_packs = [r for r in rows.values() if r["_ts"] and age_days(r["_ts"], latest_ts) <= CURRENT_DAYS]
+    behind_packs  = [r for r in rows.values() if r["_ts"] and CURRENT_DAYS < age_days(r["_ts"], latest_ts) <= BEHIND_DAYS]
+    stale_packs   = [r for r in rows.values() if r["_ts"] and age_days(r["_ts"], latest_ts) > BEHIND_DAYS]
+    nodate_packs  = [r for r in rows.values() if not r["_ts"]]
 
-        if size is None:
-            status, sc = "FAIL", RED
-            notes.append("CDN unreachable")
-            fails += 1
-        elif size < MIN_SIZE_BYTES:
-            status, sc = "FAIL", RED
-            notes.append("TOO SMALL" if size > 0 else "ZERO SIZE")
-            fails += 1
-        elif ba is not None and ba > STALE_DAYS:
-            status, sc = "STALE", YELLOW
-            stale += 1
-        else:
-            status, sc = "OK", GREEN
-            passes += 1
+    print(f"  Most recent pack: {fmt_date(latest_ts)} ({age_days(latest_ts, now):.1f}d ago)")
+    print(f"  {c(f'CURRENT: {len(current_packs)}', GREEN)}  "
+          f"{c(f'BEHIND: {len(behind_packs)}', YELLOW)}  "
+          f"{c(f'STALE: {len(stale_packs)}', RED)}  "
+          f"NO_DATE: {len(nodate_packs)}")
 
-        print(f"  {c(f'[{status}]', sc)} id={pid:<12} {title:<45}  {' '.join(notes)}")
+    def print_pack(r, lag_str):
+        pid   = r["id"]
+        title = r["title"][:40]
+        dt    = fmt_date(r["_ts"])
+        trails = r.get("numTrails", "?")
+        print(f"    {dt}  {lag_str:>14}  trails={trails:>5}  {title}")
 
-    return passes, fails, stale
+    if behind_packs:
+        behind_packs.sort(key=lambda r: r["_ts"])
+        print(f"\n  {c(f'BEHIND ({len(behind_packs)} packs — missed last run):', YELLOW)}")
+        for r in behind_packs:
+            lag = age_days(r["_ts"], latest_ts)
+            print_pack(r, f"+{lag:.0f}d behind")
 
+    if stale_packs:
+        stale_packs.sort(key=lambda r: r["_ts"])
+        print(f"\n  {c(f'STALE ({len(stale_packs)} packs):', RED)}")
+        for r in stale_packs:
+            lag = age_days(r["_ts"], latest_ts)
+            print_pack(r, f"+{lag:.0f}d behind")
+
+    if verbose and current_packs:
+        current_packs.sort(key=lambda r: r["title"])
+        print(f"\n  {c(f'CURRENT ({len(current_packs)} packs):', GREEN)}")
+        for r in current_packs:
+            print_pack(r, "current")
+
+    if nodate_packs:
+        print(f"\n  {c(f'NO DATE ({len(nodate_packs)} packs):', DIM)}")
+        for r in nodate_packs:
+            print(f"    {r['title']}")
+
+    return len(current_packs), len(behind_packs), len(stale_packs)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Audit production data packs via the getPackageList API."
+        description="Audit production data pack build dates via embedded timestamps."
     )
     parser.add_argument(
         "--project",
@@ -206,29 +326,34 @@ def main():
         default="all",
         help="Project type to audit (default: all)",
     )
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Also print CURRENT (passing) packs",
+    )
     args = parser.parse_args()
 
     projects = list(PROJECTS.keys()) if args.project == "all" else [args.project]
 
-    total_pass = total_fail = total_stale = 0
+    total_ok = total_behind = total_stale = 0
     for project in projects:
         if project == "climb":
-            p, f, s = audit_climb()
+            ok, behind, stale = audit_climb(args.verbose)
         else:
-            p, f, s = audit_ap(project)
-        total_pass  += p
-        total_fail  += f
-        total_stale += s
+            ok, behind, stale = audit_ap(project, args.verbose)
+        total_ok     += ok
+        total_behind += behind
+        total_stale  += stale
 
-    print(f"\n{'=' * 50}")
+    print(f"\n{'=' * 55}")
     print(
-        f"Summary:  {c(f'PASS={total_pass}', GREEN)}"
-        f"  {c(f'FAIL={total_fail}', RED)}"
-        f"  {c(f'STALE={total_stale}', YELLOW)}"
+        f"Summary:  {c(f'CURRENT={total_ok}', GREEN)}"
+        f"  {c(f'BEHIND={total_behind}', YELLOW)}"
+        f"  {c(f'STALE={total_stale}', RED)}"
     )
-    print(f"{'=' * 50}")
+    print(f"{'=' * 55}")
 
-    sys.exit(0 if total_fail == 0 else 1)
+    sys.exit(0 if (total_behind + total_stale) == 0 else 1)
 
 
 if __name__ == "__main__":
