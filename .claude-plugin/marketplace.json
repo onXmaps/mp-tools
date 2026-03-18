@@ -17,7 +17,7 @@
       "author": {
         "name": "eric.internicola"
       },
-      "source": "."
+      "source": "./plugins/mp-tools"
     }
   ]
 }
