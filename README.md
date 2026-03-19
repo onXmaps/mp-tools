@@ -1,6 +1,6 @@
 # Mountain Project Tools (mp-tools)
 
-A standalone Claude Code plugin for Mountain Project / onX Adventure development. Provides skills for API testing, debugging topo overlays, auditing data packs, and managing release branches.
+A standalone Claude Code plugin for Mountain Project / onX Adventure development. Provides skills for API testing, debugging topo overlays, auditing data packs, managing release branches, and checking deployment status.
 
 ## Installation
 
@@ -78,6 +78,22 @@ Guidance for creating and managing Mountain Project release branches.
 
 See `skills/release-branch/SKILL.md` for complete documentation.
 
+### deployment-status
+
+Check whether an `adventure-project` PR, branch, or commit has been deployed to the Daily or Production environments.
+
+**Use this skill when:**
+- Verifying if a merged PR has reached Production or Daily
+- Answering questions like "is this on prod yet?" or "has X been deployed?"
+- Checking which commits are queued between the current deployed tag and a target commit
+
+**How it works:**
+- Reads `container_tag` from `onx-daily.tfvars` and `onx-production.tfvars` in the `atlantis-adventure-project` repo
+- Uses `git merge-base --is-ancestor` to determine if the target commit is included in each deployed tag
+- Reports a clear ✅/❌ summary per environment
+
+See `skills/deployment-status/SKILL.md` for complete documentation.
+
 ## Requirements
 
 - Node.js (for running TypeScript scripts)
@@ -104,5 +120,6 @@ To add new skills or improve existing ones:
 
 ## Version History
 
+- **1.2.0** — Add `deployment-status` skill for checking Daily/Production deploy status
 - **1.1.0** — Add `datapack-audit` skill for mobile data pack failure detection
 - **1.0.0** — Initial release with `api-client` and `release-branch` skills
