@@ -1,6 +1,6 @@
 ---
 name: mp-release-branch
-description: This skill should be used when cutting a CoreAP release branch. It reads the current version from Base.xcconfig, proposes the rc-v<VERSION> branch name, updates CHANGELOG.md with changes since the last release, commits, pushes the branch, and opens a PR targeting intere/latest.
+description: This skill should be used when cutting a CoreAP release branch. It reads the current version from Base.xcconfig, proposes the rc-v<VERSION> branch name, updates CHANGELOG.md with changes since the last release, generates a QA test plan in Docs/, commits both, pushes the branch, and opens a PR targeting intere/latest.
 ---
 
 # CoreAP Release Branch
@@ -9,7 +9,7 @@ Cut a release branch for the CoreAP iOS monorepo, update the changelog, and open
 
 ## Purpose
 
-Automate the CoreAP release branch workflow: read the current marketing version, propose the release branch name, update CHANGELOG.md with changes since the last release, push the branch, and create a PR targeting `intere/latest`.
+Automate the CoreAP release branch workflow: read the current marketing version, propose the release branch name, update CHANGELOG.md with changes since the last release, generate a QA test plan, push the branch, and create a PR targeting `intere/latest`.
 
 ## Workflow
 
@@ -80,22 +80,99 @@ Keep entries concise — one line per meaningful change, referencing the PR numb
 git checkout -b rc-v<VERSION>
 ```
 
-### Step 6 — Commit the changelog update
+### Step 6 — Generate the QA test plan
 
-Stage and commit only the CHANGELOG.md change:
+**Scope:** The test plan covers only what is **new since the previous release**. Read the two most recent entries in `CHANGELOG.md` to establish the diff:
 
-```bash
-git add CHANGELOG.md
-git commit -m "📝 Update CHANGELOG for rc-v<VERSION>"
+- **Current version** (`<VERSION>`) — the entry you just wrote/updated in Step 4.
+- **Previous version** (`<PREV_VERSION>`) — the entry immediately below it in the file.
+
+Any item that appears in **both** entries (i.e., was already shipped in `<PREV_VERSION>`) must be **excluded** from the test plan. Only items present in `<VERSION>` but absent from `<PREV_VERSION>` belong in the plan.
+
+Create `Docs/TestPlan-<VERSION>.md` using this structure:
+
+```markdown
+# QA Test Plan — <VERSION>
+
+**Release branch:** `rc-v<VERSION>`
+**Date:** <TODAY>
+**Scope:** Changes since <PREV_VERSION>
+**Apps in scope:** <list primary apps affected by this release>
+
+---
+
+## <Feature or area name> (<ticket>, <PR>)
+
+### <Sub-scenario>
+- [ ] <Step-by-step test case with clear pass/fail criteria>
+- [ ] <Edge case or offline scenario>
+...
+
+---
+
+## Crash regression
+
+New crash fixes since <PREV_VERSION> (omit any fixed in <PREV_VERSION> or earlier):
+
+| Crash | Steps to reproduce |
+|---|---|
+| <description> | <minimal repro steps> |
+
+---
+
+## Smoke test
+
+Quick pass to confirm nothing regressed.
+
+- [ ] Search for a route by name. Navigate to the route detail screen.
+- [ ] Open an area. Browse sub-areas and routes.
+- [ ] Download a single data pack. Verify it installs and offline data is accessible.
+- [ ] Log out and log back in.
+
+---
+
+## Devices / OS
+
+Run critical paths on at minimum:
+
+| Device | OS |
+|---|---|
+| iPhone 16 Pro | iOS 18.x |
+| iPhone SE (3rd gen) | iOS 17.x |
+| iPad (any) | iOS 17.x |
+
+---
+
+## Notes
+
+<Any prerequisite state, test accounts, feature flags, or backend dependencies.>
 ```
 
-### Step 7 — Push the branch
+**Rules for populating test cases:**
+- **Only include items new since `<PREV_VERSION>`.** If a feature or fix appears in `<PREV_VERSION>`'s CHANGELOG entry, omit it entirely — it was already QA'd.
+- Write one section per feature or significant bug fix that is new in this release.
+- Each section must include a happy-path case, at least one edge case, and (where applicable) an offline/network-interrupted case.
+- Crash fixes get a row in the **Crash regression** table, not a full section. Only include crashes first fixed in `<VERSION>`.
+- Reference the CHANGELOG ticket/PR numbers in each section header.
+- Keep steps imperative and unambiguous — a QA engineer with no implementation knowledge should be able to follow them.
+- Note any backend or feature-flag prerequisites in the Notes section (e.g., a server-side PR that must be deployed before testing).
+
+### Step 7 — Commit changelog and test plan
+
+Stage and commit both files together:
+
+```bash
+git add CHANGELOG.md Docs/TestPlan-<VERSION>.md
+git commit -m "📝 Update CHANGELOG and add QA test plan for rc-v<VERSION>"
+```
+
+### Step 8 — Push the branch
 
 ```bash
 git push -u origin rc-v<VERSION>
 ```
 
-### Step 8 — Create the PR
+### Step 9 — Create the PR
 
 Use the `gh` CLI to create a PR targeting `intere/latest`:
 
@@ -110,6 +187,7 @@ gh pr create \
 
 ## Checklist
 - [ ] CHANGELOG reviewed
+- [ ] QA test plan reviewed (`Docs/TestPlan-<VERSION>.md`)
 - [ ] Version confirmed in Base.xcconfig
 - [ ] CI passes
 EOF
@@ -124,6 +202,7 @@ Populate the PR body with the CHANGELOG section for this version. Return the PR 
 |------|---------|
 | `Base.xcconfig` | Version source — `MARKETING_VERSION` |
 | `CHANGELOG.md` | Release notes — update before committing |
+| `Docs/TestPlan-<VERSION>.md` | QA test plan — generated from CHANGELOG, committed with the branch |
 
 ## Conventions
 
